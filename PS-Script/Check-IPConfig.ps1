@@ -372,7 +372,7 @@ function New-ServerTile {
     $lblIp.BackColor      = [System.Drawing.Color]::Transparent
     $lblIp.Location       = New-Object System.Drawing.Point(6, 42)
     $lblIp.Size           = New-Object System.Drawing.Size(($TILE_W - 10), 16)
-    $lblIp.AutoEllipsis   = $false
+    $lblIp.AutoEllipsis   = $true
     $lblIp.Tag            = 'ip'
     $tile.Controls.Add($lblIp)
 
@@ -402,8 +402,10 @@ function Update-TileState {
 
     foreach ($c in $tile.Controls) {
         switch ($c.Tag) {
-            'status' { $c.Text = $StatusText; $c.ForeColor = $colors.Text }
-            'ip'     { $c.Text = $IpText;     $c.ForeColor = $colors.Text }
+            'status' { $c.Text = ($StatusText -replace '?
+.*','').Trim(); $c.ForeColor = $colors.Text }
+            'ip'     { $c.Text = ($IpText     -replace '?
+.*','').Trim(); $c.ForeColor = $colors.Text }
         }
     }
     [System.Windows.Forms.Application]::DoEvents()
@@ -680,10 +682,15 @@ $script:QueryScriptBlock = {
         $primaryDns2    = if ($primary.DNS.Count -gt 1) { $primary.DNS[1] } else { '' }
         $primaryMask    = PrefixToMask $primary.PrefixLen
 
-        $extraCount     = $ordered.Count - 1
-        $extraSuffix    = if ($extraCount -gt 0) { " (+$extraCount)" } else { '' }
-        $tileStatusText = "Status: $primaryIpType"
-        $tileIpText     = "IP:     $primaryIP$extraSuffix"
+        # Count distinct adapter aliases, excluding the primary - for the (+N) suffix
+        $distinctAliases = @($ordered | Select-Object -ExpandProperty Alias -Unique)
+        $extraCount      = $distinctAliases.Count - 1
+        $extraSuffix     = if ($extraCount -gt 0) { " (+$extraCount)" } else { '' }
+        # Force primary IP to a clean single string - guard against array bleed
+        $cleanPrimaryIP  = [string]($primaryIP -split '?
+' | Select-Object -First 1).Trim()
+        $tileStatusText  = "Status: $primaryIpType"
+        $tileIpText      = "IP:     $cleanPrimaryIP$extraSuffix"
 
         $prevAlias = $null
         foreach ($a in $ordered) {
