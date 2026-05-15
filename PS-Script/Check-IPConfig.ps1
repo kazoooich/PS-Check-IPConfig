@@ -370,8 +370,9 @@ function New-ServerTile {
     $lblIp.Font           = New-Object System.Drawing.Font('Consolas', 8)
     $lblIp.ForeColor      = $clrMuted
     $lblIp.BackColor      = [System.Drawing.Color]::Transparent
-    $lblIp.Location       = New-Object System.Drawing.Point(6, 43)
-    $lblIp.Size           = New-Object System.Drawing.Size(($TILE_W - 10), 22)
+    $lblIp.Location       = New-Object System.Drawing.Point(6, 42)
+    $lblIp.Size           = New-Object System.Drawing.Size(($TILE_W - 10), 16)
+    $lblIp.AutoEllipsis   = $false
     $lblIp.Tag            = 'ip'
     $tile.Controls.Add($lblIp)
 
@@ -434,12 +435,15 @@ function Select-Tile {
         $btnReboot.Enabled = $data.Success
 
         if ($data.Success) {
-            # Set Static: grey out if already Static
+            # Static server: show Edit Static (enabled) so IP can be changed
+            # DHCP server: show Set Static (enabled) to convert it
             if ($data.IpType -eq 'Static') {
-                $btnSetStatic.Enabled   = $false
-                $btnSetStatic.BackColor = $clrBtnDisabled
-                $btnSetStatic.ForeColor = $clrMuted
+                $btnSetStatic.Text      = 'Edit Static'
+                $btnSetStatic.Enabled   = $true
+                $btnSetStatic.BackColor = $clrAmber
+                $btnSetStatic.ForeColor = $clrFormBg
             } else {
+                $btnSetStatic.Text      = 'Set Static'
                 $btnSetStatic.Enabled   = $true
                 $btnSetStatic.BackColor = $clrGreen
                 $btnSetStatic.ForeColor = $clrFormBg
@@ -456,6 +460,7 @@ function Select-Tile {
                 $btnSetDHCP.ForeColor = $clrFormBg
             }
         } else {
+            $btnSetStatic.Text      = 'Set Static'
             $btnSetStatic.Enabled   = $false
             $btnSetStatic.BackColor = $clrBtnDisabled
             $btnSetStatic.ForeColor = $clrMuted
@@ -466,6 +471,7 @@ function Select-Tile {
     } else {
         $btnRescan.Enabled = $true
         $btnReboot.Enabled = $false
+        $btnSetStatic.Text      = 'Set Static'
         $btnSetStatic.Enabled   = $false
         $btnSetStatic.BackColor = $clrBtnDisabled
         $btnSetStatic.ForeColor = $clrMuted
@@ -551,12 +557,8 @@ $script:QueryScriptBlock = {
     try {
         $sessionOpt = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 20000 -CancelTimeout 5000
         $result = Invoke-Command -ComputerName $Server -SessionOption $sessionOpt -ScriptBlock {
-            $adapters = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null }
-
-            if (-not $adapters) {
-                # Fall back to any adapter with an IP
-                $adapters = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null }
-            }
+            # Collect every adapter that has at least one IPv4 address configured
+            $adapters = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null }
 
             $adapterList = foreach ($a in $adapters) {
                 $dhcpEnabled = $false
@@ -1078,16 +1080,17 @@ $btnClearTiles.Add_Click({
     $script:ServerData     = @{}
     $script:SelectedServer = $null
     $btnRescan.Enabled     = $false
-    $btnSetStatic.Enabled  = $false
+    $btnSetStatic.Text      = 'Set Static'
+    $btnSetStatic.Enabled   = $false
     $btnSetStatic.BackColor = $clrBtnDisabled
     $btnSetStatic.ForeColor = $clrMuted
-    $btnSetDHCP.Enabled    = $false
-    $btnSetDHCP.BackColor  = $clrBtnDisabled
-    $btnSetDHCP.ForeColor  = $clrMuted
-    $btnReboot.Enabled     = $false
+    $btnSetDHCP.Enabled     = $false
+    $btnSetDHCP.BackColor   = $clrBtnDisabled
+    $btnSetDHCP.ForeColor   = $clrMuted
+    $btnReboot.Enabled      = $false
     $rtbDetail.Clear()
-    $lblDetail.Text        = 'IP Detail:  (click a tile above to view)'
-    $statusLabel.Text      = 'Cleared.'
+    $lblDetail.Text         = 'IP Detail:  (click a tile above to view)'
+    $statusLabel.Text       = 'Cleared.'
     $btnRun.Enabled        = $true
     $btnRun.Text           = '> Run'
 })
@@ -1209,10 +1212,14 @@ $btnSetStatic.Add_Click({
                 Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
                 Remove-NetRoute     -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
                 New-NetIPAddress -InterfaceIndex $idx -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $GW -ErrorAction Stop | Out-Null
-                $dnsServers = @($DNS1) | Where-Object { $_ -ne '' }
-                if ($DNS2 -ne '') { $dnsServers += $DNS2 }
+                # Build DNS list - index 0 = Preferred, index 1 = Alternate
+                $dnsServers = @()
+                if ($DNS1 -and $DNS1.Trim() -ne '') { $dnsServers += $DNS1.Trim() }
+                if ($DNS2 -and $DNS2.Trim() -ne '') { $dnsServers += $DNS2.Trim() }
                 if ($dnsServers.Count -gt 0) {
-                    Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsServers -ErrorAction SilentlyContinue
+                    Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsServers -ErrorAction Stop
+                } else {
+                    Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
                 }
             } -ArgumentList $IP, $Prefix, $GW, $DNS1, $DNS2 -ErrorAction Stop
             return [PSCustomObject]@{ Success = $true;  Error = '';   Server = $Server; Action = 'SetStatic'; IP = $IP; Sub = ''; GW = $GW; DNS1 = $DNS1; DNS2 = $DNS2 }
