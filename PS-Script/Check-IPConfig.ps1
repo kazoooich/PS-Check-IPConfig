@@ -33,6 +33,7 @@ $clrAmber        = [System.Drawing.Color]::FromArgb(249, 226, 175)
 $clrTileGrey     = [System.Drawing.Color]::FromArgb( 49,  50,  68)
 $clrTileBgGrey   = [System.Drawing.Color]::FromArgb( 49,  50,  68)
 $clrTileBgGreen  = [System.Drawing.Color]::FromArgb( 24,  60,  36)
+$clrTileBgOrange = [System.Drawing.Color]::FromArgb( 70,  40,   0)
 $clrTileBgRed    = [System.Drawing.Color]::FromArgb( 70,  20,  30)
 $clrBtnActive    = [System.Drawing.Color]::FromArgb(137, 180, 250)
 $clrBtnInactive  = [System.Drawing.Color]::FromArgb( 60,  64,  90)
@@ -305,7 +306,7 @@ function Set-IPTypeToggle {
         $srv = $tile.Tag
         if ($script:ServerData.ContainsKey($srv)) {
             $data = $script:ServerData[$srv]
-            if ($data.State -ne 'pending') {
+            if ($data.IpType -ne 'pending') {
                 Update-TileState $srv $data.IpType $data.StatusText $data.IpText
             }
         }
@@ -321,13 +322,8 @@ $btnToggleDHCP.Add_Click({   Set-IPTypeToggle 'DHCP'   })
 
 function Get-TileColors {
     param([string]$IpType)
-    # IpType = 'Static' or 'DHCP' or 'pending' or 'error'
-    # Green  = matches required type
-    # Orange = wrong IP type (warning, not a hard error)
-    # Red    = connection failed / job error
     if ($IpType -eq 'pending') { return @{ Bg = $clrTileBgGrey;   Text = $clrMuted  } }
     if ($IpType -eq 'error')   { return @{ Bg = $clrTileBgRed;    Text = $clrRed    } }
-
     if ($IpType -eq $script:RequiredIPType) {
         return @{ Bg = $clrTileBgGreen;  Text = $clrGreen  }
     } else {
@@ -571,9 +567,8 @@ $script:QueryScriptBlock = {
                     if ($dns) { $dnsServers = $dns.ServerAddresses }
                 } catch {}
 
-                # PrefixLength can come back as ArrayList on some systems - force int
                 $rawPrefix = if ($a.IPv4Address) { $a.IPv4Address.PrefixLength } else { 0 }
-                $prefix = if ($rawPrefix -is [System.Collections.IEnumerable] -and $rawPrefix -isnot [string]) {
+                $pfx = if ($rawPrefix -is [System.Collections.IEnumerable] -and $rawPrefix -isnot [string]) {
                     [int]($rawPrefix | Select-Object -First 1)
                 } else { [int]$rawPrefix }
 
@@ -581,7 +576,7 @@ $script:QueryScriptBlock = {
                     Alias       = $a.InterfaceAlias
                     Index       = $a.InterfaceIndex
                     IPAddress   = if ($a.IPv4Address) { $a.IPv4Address.IPAddress } else { '' }
-                    PrefixLen   = $prefix
+                    PrefixLen   = $pfx
                     Gateway     = if ($a.IPv4DefaultGateway) { $a.IPv4DefaultGateway.NextHop } else { '' }
                     DhcpEnabled = $dhcpEnabled
                     DNS         = $dnsServers
@@ -625,7 +620,9 @@ $script:QueryScriptBlock = {
         $primaryMask = PrefixToMask $sorted[0].PrefixLen
 
         $tileStatusText = "Status: $primaryIpType"
-        $tileIpText     = "IP:     $primaryIP"
+        $extraCount     = $sorted.Count - 1
+        $extraSuffix    = if ($extraCount -gt 0) { " (+$extraCount)" } else { '' }
+        $tileIpText     = "IP:     $primaryIP$extraSuffix"
 
         foreach ($a in $sorted) {
             $ipType   = if ($a.DhcpEnabled) { 'DHCP' } else { 'Static' }
@@ -1223,11 +1220,12 @@ $btnReboot.Add_Click({
 
 #region -- Load servers.conf -------------------------------------------------
 
-$scriptRoot = if ($PSScriptRoot -ne $null -and $PSScriptRoot -ne '') {
-    $PSScriptRoot
-} elseif ($MyInvocation.MyCommand.Path -ne $null -and $MyInvocation.MyCommand.Path -ne '') {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
-} else { $null }
+$scriptRoot = $null
+if ($PSScriptRoot        -and $PSScriptRoot        -ne '') { $scriptRoot = $PSScriptRoot }
+elseif ($PSCommandPath   -and $PSCommandPath        -ne '') { $scriptRoot = Split-Path -Parent $PSCommandPath }
+elseif ($MyInvocation.MyCommand.Path -and $MyInvocation.MyCommand.Path -ne '') {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
 if ($scriptRoot) {
     $confPath = Join-Path $scriptRoot 'servers.conf'
     if (Test-Path $confPath) {
