@@ -1202,8 +1202,9 @@ $btnReboot.Add_Click({
 
 #region -- Load servers.conf -------------------------------------------------
 
-$confPath = Join-Path $PSScriptRoot 'servers.conf'
-if (Test-Path $confPath) {
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$confPath = if ($scriptRoot) { Join-Path $scriptRoot 'servers.conf' } else { '' }
+if ($confPath -and (Test-Path $confPath)) {
     $confServers = Get-Content $confPath |
                    ForEach-Object { $_.Trim() } |
                    Where-Object   { $_ -ne '' -and -not $_.StartsWith('#') } |
