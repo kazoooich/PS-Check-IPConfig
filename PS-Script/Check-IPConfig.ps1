@@ -402,9 +402,11 @@ function Update-TileState {
 
     foreach ($c in $tile.Controls) {
         switch ($c.Tag) {
-            'status' { $c.Text = ($StatusText -replace '?
+            'status' { $c.Text = ($StatusText -replace '
+?
 .*','').Trim(); $c.ForeColor = $colors.Text }
-            'ip'     { $c.Text = ($IpText     -replace '?
+            'ip'     { $c.Text = ($IpText     -replace '
+?
 .*','').Trim(); $c.ForeColor = $colors.Text }
         }
     }
@@ -687,10 +689,11 @@ $script:QueryScriptBlock = {
         $extraCount      = $distinctAliases.Count - 1
         $extraSuffix     = if ($extraCount -gt 0) { " (+$extraCount)" } else { '' }
         # Force primary IP to a clean single string - guard against array bleed
-        $cleanPrimaryIP  = [string]($primaryIP -split '?
+        $cleanPrimaryIP  = [string]($primaryIP -split '
+?
 ' | Select-Object -First 1).Trim()
         $tileStatusText  = "Status: $primaryIpType"
-        $tileIpText      = "IP:     $cleanPrimaryIP$extraSuffix"
+        $tileIpText      = "IP: $cleanPrimaryIP$extraSuffix"
 
         $prevAlias = $null
         foreach ($a in $ordered) {
