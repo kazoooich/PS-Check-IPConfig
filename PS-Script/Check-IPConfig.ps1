@@ -491,10 +491,16 @@ function Add-DetailLine {
     )
     if (-not $script:ServerData.ContainsKey($ServerName)) {
         $script:ServerData[$ServerName] = [PSCustomObject]@{
-            Lines   = [System.Collections.Generic.List[PSCustomObject]]::new()
-            State   = 'pending'
-            IpType  = 'pending'
-            Success = $false
+            Lines       = [System.Collections.Generic.List[PSCustomObject]]::new()
+            IpType      = 'pending'
+            StatusText  = ''
+            IpText      = ''
+            PrimaryIP   = ''
+            PrimaryMask = ''
+            PrimaryGW   = ''
+            PrimaryDNS1 = ''
+            PrimaryDNS2 = ''
+            Success     = $false
         }
     }
     $script:ServerData[$ServerName].Lines.Add([PSCustomObject]@{ Text = $Text; Color = $Color })
@@ -682,9 +688,16 @@ function Apply-JobResult {
         $script:ServerData[$srv].Lines.Clear()
     } else {
         $script:ServerData[$srv] = [PSCustomObject]@{
-            Lines   = [System.Collections.Generic.List[PSCustomObject]]::new()
-            IpType  = 'pending'
-            Success = $false
+            Lines       = [System.Collections.Generic.List[PSCustomObject]]::new()
+            IpType      = 'pending'
+            StatusText  = ''
+            IpText      = ''
+            PrimaryIP   = ''
+            PrimaryMask = ''
+            PrimaryGW   = ''
+            PrimaryDNS1 = ''
+            PrimaryDNS2 = ''
+            Success     = $false
         }
     }
     if ($script:SelectedServer -eq $srv) { $rtbDetail.Clear() }
@@ -1202,16 +1215,24 @@ $btnReboot.Add_Click({
 
 #region -- Load servers.conf -------------------------------------------------
 
-$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$confPath = if ($scriptRoot) { Join-Path $scriptRoot 'servers.conf' } else { '' }
-if ($confPath -and (Test-Path $confPath)) {
-    $confServers = Get-Content $confPath |
-                   ForEach-Object { $_.Trim() } |
-                   Where-Object   { $_ -ne '' -and -not $_.StartsWith('#') } |
-                   Select-Object  -Unique
-    if ($confServers) {
-        $txtServers.Text  = ($confServers -join "`r`n")
-        $statusLabel.Text = "Loaded $($confServers.Count) server(s) from servers.conf"
+$scriptRoot = if ($PSScriptRoot -ne $null -and $PSScriptRoot -ne '') {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path -ne $null -and $MyInvocation.MyCommand.Path -ne '') {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+} else {
+    $null
+}
+if ($scriptRoot) {
+    $confPath = Join-Path $scriptRoot 'servers.conf'
+    if (Test-Path $confPath) {
+        $confServers = Get-Content $confPath |
+                       ForEach-Object { $_.Trim() } |
+                       Where-Object   { $_ -ne '' -and -not $_.StartsWith('#') } |
+                       Select-Object  -Unique
+        if ($confServers) {
+            $txtServers.Text  = ($confServers -join "`r`n")
+            $statusLabel.Text = "Loaded $($confServers.Count) server(s) from servers.conf"
+        }
     }
 }
 
