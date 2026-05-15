@@ -273,9 +273,11 @@ Update-Layout
 $script:ServerData      = @{}
 $script:SelectedServer  = $null
 $script:ActiveJobs      = @{}
+$script:JobStartTime    = @{}
 $script:PendingCount    = 0
 $script:RebootTimer     = $null
 $script:RequiredIPType  = 'Static'   # default
+$script:JobTimeoutSecs  = 35         # kill any job still running after this long
 
 #endregion
 
@@ -546,7 +548,8 @@ $script:QueryScriptBlock = {
     Line '' 'Muted'
 
     try {
-        $result = Invoke-Command -ComputerName $Server -ScriptBlock {
+        $sessionOpt = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 20000 -CancelTimeout 5000
+        $result = Invoke-Command -ComputerName $Server -SessionOption $sessionOpt -ScriptBlock {
             $adapters = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null }
 
             if (-not $adapters) {
@@ -567,22 +570,44 @@ $script:QueryScriptBlock = {
                     if ($dns) { $dnsServers = $dns.ServerAddresses }
                 } catch {}
 
-                $rawPrefix = if ($a.IPv4Address) { $a.IPv4Address.PrefixLength } else { 0 }
-                $pfx = if ($rawPrefix -is [System.Collections.IEnumerable] -and $rawPrefix -isnot [string]) {
-                    [int]($rawPrefix | Select-Object -First 1)
-                } else { [int]$rawPrefix }
+                $gw = if ($a.IPv4DefaultGateway) { $a.IPv4DefaultGateway.NextHop } else { '' }
 
-                [PSCustomObject]@{
-                    Alias       = $a.InterfaceAlias
-                    Index       = $a.InterfaceIndex
-                    IPAddress   = if ($a.IPv4Address) { $a.IPv4Address.IPAddress } else { '' }
-                    PrefixLen   = $pfx
-                    Gateway     = if ($a.IPv4DefaultGateway) { $a.IPv4DefaultGateway.NextHop } else { '' }
-                    DhcpEnabled = $dhcpEnabled
-                    DNS         = $dnsServers
+                # IPv4Address can be an array if the adapter has multiple IPs - emit one object per IP
+                $ipEntries = @($a.IPv4Address)
+                if (-not $ipEntries -or $ipEntries.Count -eq 0) {
+                    # No IPs on this adapter - emit a placeholder so adapter still appears
+                    [PSCustomObject]@{
+                        Alias       = $a.InterfaceAlias
+                        Index       = $a.InterfaceIndex
+                        IPAddress   = ''
+                        PrefixLen   = 0
+                        Gateway     = $gw
+                        DhcpEnabled = $dhcpEnabled
+                        DNS         = $dnsServers
+                    }
+                } else {
+                    $firstOnAdapter = $true
+                    foreach ($ipEntry in $ipEntries) {
+                        $rawPrefix = $ipEntry.PrefixLength
+                        $pfx = if ($rawPrefix -is [System.Collections.IEnumerable] -and $rawPrefix -isnot [string]) {
+                            [int]($rawPrefix | Select-Object -First 1)
+                        } else { [int]$rawPrefix }
+
+                        [PSCustomObject]@{
+                            Alias       = $a.InterfaceAlias
+                            Index       = $a.InterfaceIndex
+                            IPAddress   = [string]$ipEntry.IPAddress
+                            PrefixLen   = $pfx
+                            # Only carry GW/DNS on first IP entry per adapter
+                            Gateway     = if ($firstOnAdapter) { $gw } else { '' }
+                            DhcpEnabled = $dhcpEnabled
+                            DNS         = if ($firstOnAdapter) { $dnsServers } else { @() }
+                        }
+                        $firstOnAdapter = $false
+                    }
                 }
             }
-            $adapterList
+            @($adapterList)
         } -ErrorAction Stop
 
         if (-not $result) {
@@ -602,48 +627,94 @@ $script:QueryScriptBlock = {
             }
         }
 
-        # Sort: gateway-bearing adapters first (primary interface)
-        $sorted = @($result | Sort-Object { if ($_.Gateway) { 0 } else { 1 } })
-
-        $primaryIpType  = if ($sorted[0].DhcpEnabled) { 'DHCP' } else { 'Static' }
-        $primaryIP      = $sorted[0].IPAddress
-        $primaryGW      = $sorted[0].Gateway
-        $primaryDns1    = if ($sorted[0].DNS.Count -gt 0) { $sorted[0].DNS[0] } else { '' }
-        $primaryDns2    = if ($sorted[0].DNS.Count -gt 1) { $sorted[0].DNS[1] } else { '' }
-
         # Convert prefix length to subnet mask
         function PrefixToMask([int]$prefix) {
             if ($prefix -lt 0 -or $prefix -gt 32) { return '0.0.0.0' }
             $mask = [uint32]([Math]::Pow(2,32) - [Math]::Pow(2, 32 - $prefix))
             return "$( ($mask -shr 24) -band 255 ).$( ($mask -shr 16) -band 255 ).$( ($mask -shr 8) -band 255 ).$( $mask -band 255 )"
         }
-        $primaryMask = PrefixToMask $sorted[0].PrefixLen
 
-        $tileStatusText = "Status: $primaryIpType"
-        $extraCount     = $sorted.Count - 1
+        # Helper: check if an IP is in the same subnet as the gateway
+        function Test-SameSubnet([string]$ip, [string]$gw, [int]$prefix) {
+            try {
+                $shift   = 32 - $prefix
+                $ipInt   = [uint32]([System.Net.IPAddress]::Parse($ip).GetAddressBytes() |
+                               ForEach-Object { $_ } |
+                               ForEach-Object -Begin { $acc = [uint32]0 } `
+                                              -Process { $acc = ($acc -shl 8) -bor $_ } `
+                                              -End { $acc })
+                $gwInt   = [uint32]([System.Net.IPAddress]::Parse($gw).GetAddressBytes() |
+                               ForEach-Object { $_ } |
+                               ForEach-Object -Begin { $acc = [uint32]0 } `
+                                              -Process { $acc = ($acc -shl 8) -bor $_ } `
+                                              -End { $acc })
+                $mask    = if ($shift -ge 32) { [uint32]0 } else { [uint32](0xFFFFFFFF -shl $shift) }
+                return (($ipInt -band $mask) -eq ($gwInt -band $mask))
+            } catch { return $false }
+        }
+
+        # Sort adapters: gateway-bearing first, then others
+        $sorted = @($result | Sort-Object { if ($_.Gateway) { 0 } else { 1 } })
+
+        # Pick the primary adapter: the one whose IP is in the same subnet as the DG.
+        # Fall back to first gateway-bearing adapter if none match subnet.
+        $primary = $null
+        foreach ($a in $sorted) {
+            if ($a.Gateway -and $a.IPAddress -and (Test-SameSubnet $a.IPAddress $a.Gateway $a.PrefixLen)) {
+                $primary = $a
+                break
+            }
+        }
+        if (-not $primary) { $primary = $sorted[0] }
+
+        # Re-order so primary is always first in output
+        $ordered = @($primary) + @($sorted | Where-Object { $_ -ne $primary })
+
+        $primaryIpType  = if ($primary.DhcpEnabled) { 'DHCP' } else { 'Static' }
+        $primaryIP      = $primary.IPAddress
+        $primaryGW      = $primary.Gateway
+        $primaryDns1    = if ($primary.DNS.Count -gt 0) { $primary.DNS[0] } else { '' }
+        $primaryDns2    = if ($primary.DNS.Count -gt 1) { $primary.DNS[1] } else { '' }
+        $primaryMask    = PrefixToMask $primary.PrefixLen
+
+        $extraCount     = $ordered.Count - 1
         $extraSuffix    = if ($extraCount -gt 0) { " (+$extraCount)" } else { '' }
+        $tileStatusText = "Status: $primaryIpType"
         $tileIpText     = "IP:     $primaryIP$extraSuffix"
 
-        foreach ($a in $sorted) {
-            $ipType   = if ($a.DhcpEnabled) { 'DHCP' } else { 'Static' }
-            $ipColor  = if ($a.DhcpEnabled) { 'Blue' } else { 'Green' }
-            $isPrimary = ($a -eq $sorted[0])
-            $tag       = if ($isPrimary) { '  [PRIMARY - Default Gateway]' } else { "  [Additional Adapter]" }
+        $prevAlias = $null
+        foreach ($a in $ordered) {
+            $ipType    = if ($a.DhcpEnabled) { 'DHCP' } else { 'Static' }
+            $ipColor   = if ($a.DhcpEnabled) { 'Blue' } else { 'Green' }
+            $isPrimary = ($a -eq $primary)
+            $sameAdapter = ($a.Alias -eq $prevAlias)
 
-            Line "  Adapter : $($a.Alias)"                    'Muted'
-            Line "  Type    : $ipType"                        $ipColor
+            if ($isPrimary) {
+                $tag = '  [PRIMARY - DG Subnet Match]'
+            } elseif ($sameAdapter) {
+                $tag = '  [Additional IP - same adapter]'
+            } else {
+                $tag = '  [Additional Adapter]'
+            }
+
+            # Only print adapter name header when it changes
+            if (-not $sameAdapter) {
+                Line "  Adapter : $($a.Alias)"                 'Muted'
+                Line "  Type    : $ipType"                     $ipColor
+            }
             Line "  IP Addr : $($a.IPAddress)/$($a.PrefixLen)" 'Muted'
-            Line "  Subnet  : $(PrefixToMask $a.PrefixLen)"   'Muted'
+            Line "  Subnet  : $(PrefixToMask $a.PrefixLen)"    'Muted'
             if ($a.Gateway) {
-                Line "  Gateway : $($a.Gateway)"              'Muted'
+                Line "  Gateway : $($a.Gateway)"               'Muted'
             }
             if ($a.DNS.Count -gt 0) {
-                Line "  DNS 1   : $($a.DNS[0])"               'Muted'
+                Line "  DNS 1   : $($a.DNS[0])"                'Muted'
             }
             if ($a.DNS.Count -gt 1) {
-                Line "  DNS 2   : $($a.DNS[1])"               'Muted'
+                Line "  DNS 2   : $($a.DNS[1])"                'Muted'
             }
-            Line $tag                                          'Amber'
+            $prevAlias = $a.Alias
+            Line $tag                                           'Amber'
             Line '' 'Muted'
         }
 
@@ -740,22 +811,40 @@ $script:PollTimer.Add_Tick({
     if ($script:ActiveJobs.Count -eq 0) { return }
 
     $completed = @()
+    $now = [datetime]::Now
     foreach ($kv in $script:ActiveJobs.GetEnumerator()) {
-        if ($kv.Value.State -in 'Completed','Failed','Stopped') { $completed += $kv.Key }
+        $srv = $kv.Key
+        if ($kv.Value.State -in 'Completed','Failed','Stopped') {
+            $completed += $srv
+        } elseif ($script:JobStartTime.ContainsKey($srv)) {
+            $elapsed = ($now - $script:JobStartTime[$srv]).TotalSeconds
+            if ($elapsed -gt $script:JobTimeoutSecs) {
+                # Job is hung - stop it and mark as timed out
+                Stop-Job -Job $kv.Value -ErrorAction SilentlyContinue
+                $completed += $srv
+            }
+        }
     }
 
     foreach ($srv in $completed) {
         $job = $script:ActiveJobs[$srv]
         try {
-            $result = Receive-Job -Job $job -ErrorAction Stop
-            if ($result) { Apply-JobResult $result }
-            else         { Update-TileState $srv 'error' 'No data returned' '' }
+            if ($job.State -eq 'Stopped') {
+                # Job was killed by watchdog - timed out
+                Add-DetailLine $srv "  [TIMEOUT] No response after $($script:JobTimeoutSecs)s" $clrWarn
+                Update-TileState $srv 'error' 'Timed out' ''
+            } else {
+                $result = Receive-Job -Job $job -ErrorAction Stop
+                if ($result) { Apply-JobResult $result }
+                else         { Update-TileState $srv 'error' 'No data returned' '' }
+            }
         } catch {
             Add-DetailLine $srv "  [ERROR] $($_.Exception.Message)" $clrRed
             Update-TileState $srv 'error' 'Job error' ''
         } finally {
             Remove-Job -Job $job -Force
             $script:ActiveJobs.Remove($srv)
+            $script:JobStartTime.Remove($srv)
             $script:PendingCount--
         }
     }
@@ -815,6 +904,7 @@ function Start-ServerQuery {
 
     if (-not $IsRescan) {
         $script:ServerData     = @{}
+        $script:JobStartTime   = @{}
         $script:SelectedServer = $null
         $btnRescan.Enabled     = $false
         $btnSetStatic.Enabled  = $false
@@ -855,7 +945,8 @@ function Start-ServerQuery {
 
     foreach ($srv in $Servers) {
         $job = Start-Job -ScriptBlock $script:QueryScriptBlock -ArgumentList $srv
-        $script:ActiveJobs[$srv] = $job
+        $script:ActiveJobs[$srv]         = $job
+        $script:JobStartTime[$srv]       = [datetime]::Now
     }
 
     $script:PollTimer.Start()
@@ -1220,14 +1311,20 @@ $btnReboot.Add_Click({
 
 #region -- Load servers.conf -------------------------------------------------
 
+# Resolve script directory using every available method, including current dir
 $scriptRoot = $null
-if ($PSScriptRoot        -and $PSScriptRoot        -ne '') { $scriptRoot = $PSScriptRoot }
-elseif ($PSCommandPath   -and $PSCommandPath        -ne '') { $scriptRoot = Split-Path -Parent $PSCommandPath }
+if     ($PSScriptRoot      -and $PSScriptRoot      -ne '') { $scriptRoot = $PSScriptRoot }
+elseif ($PSCommandPath     -and $PSCommandPath      -ne '') { $scriptRoot = Split-Path -Parent $PSCommandPath }
 elseif ($MyInvocation.MyCommand.Path -and $MyInvocation.MyCommand.Path -ne '') {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
-if ($scriptRoot) {
-    $confPath = Join-Path $scriptRoot 'servers.conf'
+# Always also check the current working directory as a last resort
+$searchRoots = @()
+if ($scriptRoot) { $searchRoots += $scriptRoot }
+$searchRoots += (Get-Location).Path
+
+foreach ($root in ($searchRoots | Select-Object -Unique)) {
+    $confPath = Join-Path $root 'servers.conf'
     if (Test-Path $confPath) {
         $confServers = Get-Content $confPath |
                        ForEach-Object { $_.Trim() } |
@@ -1235,8 +1332,9 @@ if ($scriptRoot) {
                        Select-Object  -Unique
         if ($confServers) {
             $txtServers.Text  = ($confServers -join "`r`n")
-            $statusLabel.Text = "Loaded $($confServers.Count) server(s) from servers.conf"
+            $statusLabel.Text = "Loaded $($confServers.Count) server(s) from servers.conf  [$confPath]"
         }
+        break
     }
 }
 
