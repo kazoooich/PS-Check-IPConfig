@@ -322,14 +322,16 @@ $btnToggleDHCP.Add_Click({   Set-IPTypeToggle 'DHCP'   })
 function Get-TileColors {
     param([string]$IpType)
     # IpType = 'Static' or 'DHCP' or 'pending' or 'error'
-    # Colour = green if IpType matches required, red if mismatch
-    if ($IpType -eq 'pending') { return @{ Bg = $clrTileBgGrey; Text = $clrMuted } }
-    if ($IpType -eq 'error')   { return @{ Bg = $clrTileBgRed;  Text = $clrRed   } }
+    # Green  = matches required type
+    # Orange = wrong IP type (warning, not a hard error)
+    # Red    = connection failed / job error
+    if ($IpType -eq 'pending') { return @{ Bg = $clrTileBgGrey;   Text = $clrMuted  } }
+    if ($IpType -eq 'error')   { return @{ Bg = $clrTileBgRed;    Text = $clrRed    } }
 
     if ($IpType -eq $script:RequiredIPType) {
-        return @{ Bg = $clrTileBgGreen; Text = $clrGreen }
+        return @{ Bg = $clrTileBgGreen;  Text = $clrGreen  }
     } else {
-        return @{ Bg = $clrTileBgRed;   Text = $clrRed   }
+        return @{ Bg = $clrTileBgOrange; Text = $clrOrange }
     }
 }
 
@@ -569,11 +571,17 @@ $script:QueryScriptBlock = {
                     if ($dns) { $dnsServers = $dns.ServerAddresses }
                 } catch {}
 
+                # PrefixLength can come back as ArrayList on some systems - force int
+                $rawPrefix = if ($a.IPv4Address) { $a.IPv4Address.PrefixLength } else { 0 }
+                $prefix = if ($rawPrefix -is [System.Collections.IEnumerable] -and $rawPrefix -isnot [string]) {
+                    [int]($rawPrefix | Select-Object -First 1)
+                } else { [int]$rawPrefix }
+
                 [PSCustomObject]@{
                     Alias       = $a.InterfaceAlias
                     Index       = $a.InterfaceIndex
                     IPAddress   = if ($a.IPv4Address) { $a.IPv4Address.IPAddress } else { '' }
-                    PrefixLen   = if ($a.IPv4Address) { $a.IPv4Address.PrefixLength } else { 0 }
+                    PrefixLen   = $prefix
                     Gateway     = if ($a.IPv4DefaultGateway) { $a.IPv4DefaultGateway.NextHop } else { '' }
                     DhcpEnabled = $dhcpEnabled
                     DNS         = $dnsServers
@@ -1219,9 +1227,7 @@ $scriptRoot = if ($PSScriptRoot -ne $null -and $PSScriptRoot -ne '') {
     $PSScriptRoot
 } elseif ($MyInvocation.MyCommand.Path -ne $null -and $MyInvocation.MyCommand.Path -ne '') {
     Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
-    $null
-}
+} else { $null }
 if ($scriptRoot) {
     $confPath = Join-Path $scriptRoot 'servers.conf'
     if (Test-Path $confPath) {
