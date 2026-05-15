@@ -277,7 +277,8 @@ $script:JobStartTime    = @{}
 $script:PendingCount    = 0
 $script:RebootTimer     = $null
 $script:RequiredIPType  = 'Static'   # default
-$script:JobTimeoutSecs  = 35         # kill any job still running after this long
+$script:JobTimeoutSecs  = 35         # kill any query job still running after this long
+$script:ActionJobs      = @{}        # background Set Static / Set DHCP jobs keyed by server
 
 #endregion
 
@@ -802,6 +803,80 @@ function Apply-JobResult {
 
 #endregion
 
+#region -- Action job polling timer ------------------------------------------
+# Polls background Set Static / Set DHCP jobs separately from query jobs
+# so they never interfere with each other
+
+$script:ActionPollTimer          = New-Object System.Windows.Forms.Timer
+$script:ActionPollTimer.Interval = 500
+
+$script:ActionPollTimer.Add_Tick({
+    if ($script:ActionJobs.Count -eq 0) { $script:ActionPollTimer.Stop(); return }
+
+    $completed = @()
+    $now = [datetime]::Now
+    foreach ($kv in $script:ActionJobs.GetEnumerator()) {
+        $srv     = $kv.Key
+        $jobInfo = $kv.Value
+        if ($jobInfo.Job.State -in 'Completed','Failed','Stopped') {
+            $completed += $srv
+        } elseif (($now - $jobInfo.StartTime).TotalSeconds -gt 40) {
+            Stop-Job -Job $jobInfo.Job -ErrorAction SilentlyContinue
+            $completed += $srv
+        }
+    }
+
+    foreach ($srv in $completed) {
+        $jobInfo = $script:ActionJobs[$srv]
+        $job     = $jobInfo.Job
+        try {
+            if ($job.State -eq 'Stopped') {
+                Add-DetailLine $srv "  [TIMEOUT] Action timed out after 40s" $clrWarn
+                Update-TileState $srv 'error' 'Action timed out' ''
+                $statusLabel.Text = "Action timed out on $srv"
+            } else {
+                $result = Receive-Job -Job $job -ErrorAction Stop
+                if ($result -and $result.Success) {
+                    if ($result.Action -eq 'SetStatic') {
+                        Add-DetailLine $srv "  Set Static succeeded. Rescanning..." $clrGreen
+                        $statusLabel.Text = "Static IP set on $srv. Rescanning..."
+                    } else {
+                        Add-DetailLine $srv "  Set DHCP succeeded. Rescanning..." $clrGreen
+                        $statusLabel.Text = "DHCP enabled on $srv. Rescanning..."
+                    }
+                    # Auto-rescan now the change is done
+                    Start-ServerQuery -Servers @($srv) -IsRescan $true
+                } elseif ($result) {
+                    $errMsg = $result.Error
+                    Add-DetailLine $srv "  [ERROR] $errMsg" $clrRed
+                    Update-TileState $srv 'error' 'Action failed' ''
+                    $statusLabel.Text = "Action failed on $srv"
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Action failed on $srv .`n`n$errMsg",
+                        'Action Failed',
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    ) | Out-Null
+                    # Re-enable buttons since it failed
+                    if ($script:SelectedServer -eq $srv -and $script:ServerData.ContainsKey($srv)) {
+                        Select-Tile $srv
+                    }
+                }
+            }
+        } catch {
+            Add-DetailLine $srv "  [ERROR] $($_.Exception.Message)" $clrRed
+            Update-TileState $srv 'error' 'Action error' ''
+        } finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            $script:ActionJobs.Remove($srv)
+        }
+    }
+
+    if ($script:ActionJobs.Count -eq 0) { $script:ActionPollTimer.Stop() }
+})
+
+#endregion
+
 #region -- Job polling timer -------------------------------------------------
 
 $script:PollTimer          = New-Object System.Windows.Forms.Timer
@@ -1026,7 +1101,7 @@ $btnSetStatic.Add_Click({
     $srv  = $script:SelectedServer
     $data = $script:ServerData[$srv]
 
-    # Build dialogue form
+    # Build dialogue form - this is still on the UI thread (instant, no network)
     $dlg               = New-Object System.Windows.Forms.Form
     $dlg.Text          = "Set Static IP  -  $($srv.ToUpper())"
     $dlg.Size          = New-Object System.Drawing.Size(360, 310)
@@ -1039,16 +1114,15 @@ $btnSetStatic.Add_Click({
     $dlg.Font          = New-Object System.Drawing.Font('Consolas', 9)
 
     $fields = @(
-        @{ Label = 'IP Address:'; Key = 'IP';   Default = $data.PrimaryIP   },
-        @{ Label = 'Subnet Mask:'; Key = 'Sub'; Default = $data.PrimaryMask },
-        @{ Label = 'Default Gateway:'; Key = 'DG'; Default = $data.PrimaryGW },
-        @{ Label = 'DNS 1:'; Key = 'DNS1'; Default = $data.PrimaryDNS1 },
-        @{ Label = 'DNS 2:'; Key = 'DNS2'; Default = $data.PrimaryDNS2 }
+        @{ Label = 'IP Address:';      Key = 'IP';   Default = $data.PrimaryIP   },
+        @{ Label = 'Subnet Mask:';     Key = 'Sub';  Default = $data.PrimaryMask },
+        @{ Label = 'Default Gateway:'; Key = 'DG';   Default = $data.PrimaryGW   },
+        @{ Label = 'DNS 1:';           Key = 'DNS1'; Default = $data.PrimaryDNS1 },
+        @{ Label = 'DNS 2:';           Key = 'DNS2'; Default = $data.PrimaryDNS2 }
     )
 
     $textBoxes = @{}
     $y = 14
-
     foreach ($f in $fields) {
         $lbl           = New-Object System.Windows.Forms.Label
         $lbl.Text      = $f.Label
@@ -1065,7 +1139,6 @@ $btnSetStatic.Add_Click({
         $txt.ForeColor   = $clrGreen
         $txt.BorderStyle = 'FixedSingle'
         $dlg.Controls.Add($txt)
-
         $textBoxes[$f.Key] = $txt
         $y += 36
     }
@@ -1093,6 +1166,7 @@ $btnSetStatic.Add_Click({
     $dlg.Controls.Add($btnCancel)
     $dlg.CancelButton = $btnCancel
 
+    # Dialog is instant - no network involved, UI is fine here
     if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
     $newIP   = $textBoxes['IP'].Text.Trim()
@@ -1107,76 +1181,48 @@ $btnSetStatic.Add_Click({
         return
     }
 
-    # Convert mask to prefix length
-    function MaskToPrefix([string]$mask) {
-        try {
-            $bytes  = $mask.Split('.') | ForEach-Object { [Convert]::ToByte($_) }
-            $binary = ($bytes | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8,'0') }) -join ''
-            return ($binary.ToCharArray() | Where-Object { $_ -eq '1' }).Count
-        } catch { return 24 }
-    }
-    $prefix = MaskToPrefix $newSub
+    # Convert mask to prefix - done here on UI thread before handing off
+    $maskBytes  = $newSub.Split('.') | ForEach-Object { [Convert]::ToByte($_) }
+    $maskBinary = ($maskBytes | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8,'0') }) -join ''
+    $prefix     = ($maskBinary.ToCharArray() | Where-Object { $_ -eq '1' }).Count
 
-    $statusLabel.Text = "Setting static IP on $srv..."
+    # Mark tile as working so user gets visual feedback immediately
+    Update-TileState $srv 'pending' 'Setting Static...' ''
+    Add-DetailLine $srv '' $clrMuted
+    Add-DetailLine $srv "--- Set Static submitted $(Get-Date -Format 'HH:mm:ss') ---" $clrAmber
+    Add-DetailLine $srv "  IP: $newIP / $newSub  GW: $newDG" $clrMuted
+    $statusLabel.Text     = "Setting static IP on $srv (background)..."
     $btnSetStatic.Enabled = $false
     $btnSetDHCP.Enabled   = $false
 
-    try {
-        Invoke-Command -ComputerName $srv -ScriptBlock {
-            param($IP, $Prefix, $GW, $DNS1, $DNS2)
-
-            # Find the adapter with the default gateway, or the first with an IP
-            $ifIndex = $null
-            $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
-            if (-not $cfg) { $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | Select-Object -First 1 }
-            if ($cfg) { $ifIndex = $cfg.InterfaceIndex }
-            if (-not $ifIndex) { throw 'Could not find a suitable network adapter.' }
-
-            # Remove existing IP config
-            Remove-NetIPAddress  -InterfaceIndex $ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-NetRoute      -InterfaceIndex $ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-
-            # Set static IP
-            New-NetIPAddress -InterfaceIndex $ifIndex -IPAddress $IP -PrefixLength $Prefix `
-                             -DefaultGateway $GW -ErrorAction Stop | Out-Null
-
-            # Set DNS
-            $dnsServers = @($DNS1) | Where-Object { $_ -ne '' }
-            if ($DNS2 -ne '') { $dnsServers += $DNS2 }
-            if ($dnsServers.Count -gt 0) {
-                Set-DnsClientServerAddress -InterfaceIndex $ifIndex -ServerAddresses $dnsServers -ErrorAction SilentlyContinue
-            }
-
-        } -ArgumentList $newIP, $prefix, $newDG, $newDNS1, $newDNS2 -ErrorAction Stop
-
-        Add-DetailLine $srv '' $clrMuted
-        Add-DetailLine $srv "--- Static IP set $(Get-Date -Format 'HH:mm:ss') ---" $clrAmber
-        Add-DetailLine $srv "  IP: $newIP / $newSub" $clrGreen
-        Add-DetailLine $srv "  GW: $newDG  DNS: $newDNS1 / $newDNS2" $clrGreen
-        $statusLabel.Text = "Static IP set on $srv. Rescanning..."
-
-        [System.Windows.Forms.MessageBox]::Show(
-            "Static IP configured on $srv .`n`nIP:  $newIP`nSub: $newSub`nDG:  $newDG`nDNS: $newDNS1 / $newDNS2`n`nRescanning now...",
-            'Static IP Set',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-
-        Start-ServerQuery -Servers @($srv) -IsRescan $true
-
-    } catch {
-        $errMsg = $_.Exception.Message
-        Add-DetailLine $srv "  [ERROR] Set Static failed: $errMsg" $clrRed
-        $statusLabel.Text = "Set Static failed on $srv"
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to set static IP on $srv .`n`n$errMsg",
-            'Set Static Failed',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-        $btnSetStatic.Enabled = $true
-        $btnSetDHCP.Enabled   = $true
+    # Fire the network work off as a background job - UI stays responsive
+    $actionSB = {
+        param($Server, $IP, $Prefix, $GW, $DNS1, $DNS2)
+        try {
+            $sessionOpt = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 25000 -CancelTimeout 5000
+            Invoke-Command -ComputerName $Server -SessionOption $sessionOpt -ScriptBlock {
+                param($IP, $Prefix, $GW, $DNS1, $DNS2)
+                $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
+                if (-not $cfg) { $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | Select-Object -First 1 }
+                if (-not $cfg) { throw 'Could not find a suitable network adapter.' }
+                $idx = $cfg.InterfaceIndex
+                Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-NetRoute     -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+                New-NetIPAddress -InterfaceIndex $idx -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $GW -ErrorAction Stop | Out-Null
+                $dnsServers = @($DNS1) | Where-Object { $_ -ne '' }
+                if ($DNS2 -ne '') { $dnsServers += $DNS2 }
+                if ($dnsServers.Count -gt 0) {
+                    Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsServers -ErrorAction SilentlyContinue
+                }
+            } -ArgumentList $IP, $Prefix, $GW, $DNS1, $DNS2 -ErrorAction Stop
+            return [PSCustomObject]@{ Success = $true;  Error = '';   Server = $Server; Action = 'SetStatic'; IP = $IP; Sub = ''; GW = $GW; DNS1 = $DNS1; DNS2 = $DNS2 }
+        } catch {
+            return [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message; Server = $Server; Action = 'SetStatic'; IP = $IP; Sub = ''; GW = $GW; DNS1 = $DNS1; DNS2 = $DNS2 }
+        }
     }
+    $job = Start-Job -ScriptBlock $actionSB -ArgumentList $srv, $newIP, $prefix, $newDG, $newDNS1, $newDNS2
+    $script:ActionJobs[$srv] = @{ Job = $job; Action = 'SetStatic'; Sub = $newSub; StartTime = [datetime]::Now }
+    $script:ActionPollTimer.Start()
 })
 
 #endregion
@@ -1195,56 +1241,35 @@ $btnSetDHCP.Add_Click({
     )
     if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
-    $statusLabel.Text     = "Setting DHCP on $srv..."
+    Update-TileState $srv 'pending' 'Setting DHCP...' ''
+    Add-DetailLine $srv '' $clrMuted
+    Add-DetailLine $srv "--- Set DHCP submitted $(Get-Date -Format 'HH:mm:ss') ---" $clrAmber
+    $statusLabel.Text     = "Setting DHCP on $srv (background)..."
     $btnSetStatic.Enabled = $false
     $btnSetDHCP.Enabled   = $false
 
-    try {
-        Invoke-Command -ComputerName $srv -ScriptBlock {
-            $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
-            if (-not $cfg) { $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | Select-Object -First 1 }
-            if (-not $cfg) { throw 'Could not find a suitable network adapter.' }
-            $idx = $cfg.InterfaceIndex
-
-            # Enable DHCP
-            Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
-
-            # Remove static IP/route
-            Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-NetRoute     -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-
-            # Reset DNS to automatic
-            Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
-
-        } -ErrorAction Stop
-
-        Add-DetailLine $srv '' $clrMuted
-        Add-DetailLine $srv "--- DHCP enabled $(Get-Date -Format 'HH:mm:ss') ---" $clrAmber
-        Add-DetailLine $srv '  Adapter switched to DHCP. Rescanning...' $clrBlue
-        $statusLabel.Text = "DHCP enabled on $srv. Rescanning..."
-
-        [System.Windows.Forms.MessageBox]::Show(
-            "DHCP enabled on $srv .`n`nThe adapter has been switched to DHCP.`nRescanning now...",
-            'DHCP Set',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-
-        Start-ServerQuery -Servers @($srv) -IsRescan $true
-
-    } catch {
-        $errMsg = $_.Exception.Message
-        Add-DetailLine $srv "  [ERROR] Set DHCP failed: $errMsg" $clrRed
-        $statusLabel.Text = "Set DHCP failed on $srv"
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to enable DHCP on $srv .`n`n$errMsg",
-            'Set DHCP Failed',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-        $btnSetStatic.Enabled = $true
-        $btnSetDHCP.Enabled   = $true
+    $actionSB = {
+        param($Server)
+        try {
+            $sessionOpt = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 25000 -CancelTimeout 5000
+            Invoke-Command -ComputerName $Server -SessionOption $sessionOpt -ScriptBlock {
+                $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null } | Select-Object -First 1
+                if (-not $cfg) { $cfg = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -ne $null } | Select-Object -First 1 }
+                if (-not $cfg) { throw 'Could not find a suitable network adapter.' }
+                $idx = $cfg.InterfaceIndex
+                Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -Dhcp Enabled -ErrorAction Stop
+                Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-NetRoute     -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+                Set-DnsClientServerAddress -InterfaceIndex $idx -ResetServerAddresses -ErrorAction SilentlyContinue
+            } -ErrorAction Stop
+            return [PSCustomObject]@{ Success = $true;  Error = ''; Server = $Server; Action = 'SetDHCP' }
+        } catch {
+            return [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message; Server = $Server; Action = 'SetDHCP' }
+        }
     }
+    $job = Start-Job -ScriptBlock $actionSB -ArgumentList $srv
+    $script:ActionJobs[$srv] = @{ Job = $job; Action = 'SetDHCP'; Sub = ''; StartTime = [datetime]::Now }
+    $script:ActionPollTimer.Start()
 })
 
 #endregion
@@ -1344,8 +1369,10 @@ foreach ($root in ($searchRoots | Select-Object -Unique)) {
 
 $form.Add_FormClosing({
     $script:PollTimer.Stop()
+    $script:ActionPollTimer.Stop()
     if ($script:RebootTimer) { $script:RebootTimer.Stop(); $script:RebootTimer.Dispose() }
     foreach ($j in $script:ActiveJobs.Values) { Remove-Job -Job $j -Force -ErrorAction SilentlyContinue }
+    foreach ($ji in $script:ActionJobs.Values) { Remove-Job -Job $ji.Job -Force -ErrorAction SilentlyContinue }
 })
 
 #endregion
